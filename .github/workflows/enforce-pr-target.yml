@@ -1,0 +1,64 @@
+#=============================================================================
+# PIPECRAFT MANAGED WORKFLOW
+#=============================================================================
+#
+# 🔒 THIS ENTIRE FILE IS GENERATED. Edits are overwritten on the next
+#    'pipecraft generate'. Unlike pipeline.yml, nothing here is preserved.
+#
+# ⚙️  Generated from your .pipecraftrc:
+#   - initialBranch
+#   - finalBranch
+#
+# ✏️  To change this workflow, change the config above and regenerate. To add
+#    checks of your own, put them in a separate workflow file.
+#=============================================================================
+name: Enforce PR Target Branch
+
+# pull_request_target, not pull_request. GitHub's approval gate applies to pull_request runs
+# from a first-time contributor, and 'github-actions[bot]' is one, so the last promotion hop
+# (the only one whose base is 'main') opened an approval-gated run that nobody
+# approves. It expired and reported a failure against every release. pull_request_target runs
+# in the base repository's context and carries no such gate.
+#
+# The usual hazard of pull_request_target is running a fork's code with a write token. This
+# job checks out nothing and runs nothing from the pull request; it reads two ref names and
+# echoes. 'permissions: {}' removes the token as well, so there is nothing left to misuse.
+#
+# No 'branches:' filter. That filter matches on the pull request's base, so scoping it to
+# 'main' made github.base_ref always 'main' inside a run: the reject step
+# fired every time and the confirm step below could never run. Worse, a contributor who
+# followed the rejection text and retargeted the PR to 'develop' produced an
+# 'edited' event the filter excluded, so no new run started and the failed 'check-pr-target'
+# remained the latest status on that head SHA — unmergeable where branch protection requires
+# it. The filter was there to keep promotion PRs from opening approval-gated runs; the
+# pull_request_target trigger has no approval gate, and the pipecraft-promote guard on the
+# job below is what skips those PRs now.
+on:
+  pull_request_target:
+    types: [opened, edited, synchronize, reopened]
+
+permissions: {}
+
+jobs:
+  check-pr-target:
+    # Skip PipeCraft's own promotion PRs (pipecraft-promote/*). They legitimately target
+    # downstream/final branches as part of the flow; this guard is for human-authored PRs.
+    if: ${{ !startsWith(github.head_ref, 'pipecraft-promote/') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check PR base branch
+        if: github.base_ref == 'main'
+        run: |
+          echo "::error::Pull requests must target 'develop' branch, not 'main'"
+          echo "::error::Please change the base branch to 'develop'"
+          echo ""
+          echo "To fix this:"
+          echo "1. Go to your PR"
+          echo "2. Click 'Edit' next to the title"
+          echo "3. Change base branch from 'main' to 'develop'"
+          exit 1
+      
+      - name: Confirm correct target
+        if: github.base_ref == 'develop'
+        run: |
+          echo "✅ PR correctly targets 'develop' branch"
