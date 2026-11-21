@@ -1,0 +1,143 @@
+name: 'Create Release'
+description: 'Create a GitHub release with auto-generated release notes'
+author: 'PipeCraft'
+
+inputs:
+  version:
+    description: 'Version to release (e.g., v1.2.3)'
+    required: true
+  token:
+    description: 'GitHub token for authentication'
+    required: false
+    default: ${{ github.token }}
+  publish-workflow:
+    description: 'Name of the publish workflow file to trigger (e.g., publish.yml)'
+    required: false
+    default: 'publish.yml'
+  commitSha:
+    description: 'Specific commit SHA to checkout (prevents race conditions during promotion)'
+    required: false
+    default: ''
+
+outputs:
+  release_url:
+    description: 'The URL of the created release'
+    value: ${{ steps.create.outputs.release_url }}
+  release_id:
+    description: 'The ID of the created release'
+    value: ${{ steps.create.outputs.release_id }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Checkout Code
+      uses: actions/checkout@v5
+      with:
+        ref: ${{ inputs.commitSha || github.sha }}
+        fetch-depth: 0
+        token: ${{ inputs.token }}
+
+    - name: Create GitHub Release
+      id: create
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+      run: |
+        VERSION="${{ inputs.version }}"
+
+        # A missing version is a real failure (e.g. calculate-version errored), not a
+        # silent no-op. Refuse rather than create an empty/garbage release.
+        if [ -z "$VERSION" ]; then
+          echo "❌ No version provided to create-release - refusing to create an empty release."
+          echo "   (Check the version/calculate-version step output.)"
+          exit 1
+        fi
+
+        echo "📦 Creating GitHub release for $VERSION"
+
+        # Generate release notes from commits since last tag
+        PREVIOUS_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")
+
+        if [ -n "$PREVIOUS_TAG" ]; then
+          echo "📝 Generating release notes from $PREVIOUS_TAG to HEAD"
+          RELEASE_NOTES=$(git log $PREVIOUS_TAG..HEAD --pretty=format:"- %s" --no-merges)
+        else
+          echo "📝 Generating release notes from all commits"
+          RELEASE_NOTES=$(git log --pretty=format:"- %s" --no-merges)
+        fi
+
+        # Create release with notes.
+        # Disable errexit around the gh call: composite steps run with 'bash -e', and a
+        # failed command substitution in an assignment exits IMMEDIATELY — before we can
+        # capture the exit code and run the "already exists" idempotency branch below.
+        set +e
+        RELEASE_OUTPUT=$(gh release create "$VERSION" \--title "Release $VERSION" \--notes "$RELEASE_NOTES" \--latest 2>&1)
+        RELEASE_EXIT_CODE=$?
+        set -e
+
+        if [ $RELEASE_EXIT_CODE -eq 0 ]; then
+          # Extract release URL from output
+          # Guarded for the same reason the idempotent branch below guards its lookups:
+          # this runs under 'bash -eo pipefail', so a grep that matches nothing
+          # (a GitHub Enterprise host, say) would fail the assignment and abort the step
+          # before release_created=true is written. Every later re-run then takes the
+          # "already exists" branch, which writes release_created=false, and that version
+          # never dispatches publish. An unmatched URL leaves RELEASE_URL empty instead.
+          RELEASE_URL=$(echo "$RELEASE_OUTPUT" | grep -oE 'https://github.com/.*/releases/.*' || echo "")
+          echo "release_url=$RELEASE_URL" >> $GITHUB_OUTPUT
+
+          # Get release ID using gh api
+          RELEASE_ID=$(gh api repos/${{ github.repository }}/releases/tags/$VERSION --jq '.id')
+          echo "release_id=$RELEASE_ID" >> $GITHUB_OUTPUT
+
+          echo "release_created=true" >> $GITHUB_OUTPUT
+          echo "✅ Release created successfully"
+          echo "🔗 URL: $RELEASE_URL"
+        elif echo "$RELEASE_OUTPUT" | grep -qiE 'already exists'; then
+          echo "release_created=false" >> $GITHUB_OUTPUT
+          # Idempotent re-run: the release for this version already exists. Treat as
+          # success and surface the existing release's URL/ID instead of failing.
+          echo "ℹ️  Release $VERSION already exists - treating as success (idempotent)."
+          RELEASE_URL=$(gh release view "$VERSION" --json url --jq '.url' 2>/dev/null || echo "")
+          echo "release_url=$RELEASE_URL" >> $GITHUB_OUTPUT
+          RELEASE_ID=$(gh api repos/${{ github.repository }}/releases/tags/$VERSION --jq '.id' 2>/dev/null || echo "")
+          echo "release_id=$RELEASE_ID" >> $GITHUB_OUTPUT
+          echo "🔗 URL: $RELEASE_URL"
+        else
+          echo "❌ Failed to create release"
+          echo "$RELEASE_OUTPUT"
+          exit 1
+        fi
+
+    # Only a release this run created gets a publish dispatch. The pipeline reaches this
+    # action once per push to the final branch, and a push that bumps nothing resolves to
+    # the version already released, so the step above takes its idempotent branch.
+    # Dispatching again publishes a version the registry already holds, which fails and
+    # reports a red X against a release that succeeded minutes earlier.
+    - name: Trigger Publish Workflow (if exists)
+      if: steps.create.outputs.release_created == 'true'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+      run: |
+        VERSION="${{ inputs.version }}"
+        PUBLISH_WORKFLOW="${{ inputs.publish-workflow }}"
+
+        # Check if publish workflow file exists
+        if [ -f ".github/workflows/$PUBLISH_WORKFLOW" ]; then
+          echo "🔄 Triggering $PUBLISH_WORKFLOW for $VERSION"
+
+          # Trigger the publish workflow with the release tag on the final branch.
+          # This is necessary because GITHUB_TOKEN release creation doesn't trigger workflows.
+          # The ref is explicit so the dispatch lands on 'main', not on the
+          # repository's default branch.
+          if gh workflow run "$PUBLISH_WORKFLOW" --ref main --field tag="$VERSION" 2>&1; then
+            echo "✅ Publish workflow triggered for $VERSION"
+          else
+            echo "⚠️  Failed to trigger publish workflow, but continuing"
+            echo "   Check that $PUBLISH_WORKFLOW accepts workflow_dispatch with a 'tag' input"
+          fi
+        else
+          echo "ℹ️  No $PUBLISH_WORKFLOW workflow found - skipping publish trigger"
+          echo "   This is normal if you don't have a separate publish workflow"
+        fi

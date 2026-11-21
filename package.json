@@ -1,0 +1,8 @@
+{
+  "name": "pipecraft-example-mixed",
+  "version": "0.1.0",
+  "description": "Mixed-promotion example: auto-promote develop→staging, manual gate staging→main",
+  "type": "module",
+  "scripts": { "test": "node test/index.test.js", "build": "node -e \"console.log('built')\"" },
+  "license": "MIT"
+}
